@@ -83,6 +83,59 @@ def make_window(label, used_percent, resets_at):
 # ---------------------------------------------------------------- Claude
 
 
+CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"  # Claude Code 공개 OAuth 클라이언트
+CLAUDE_TOKEN_URLS = (
+    "https://platform.claude.com/v1/oauth/token",
+    "https://console.anthropic.com/v1/oauth/token",
+)
+
+
+def refresh_claude_token(path):
+    """만료된 access token을 refresh token으로 갱신하고 credentials.json에 다시 저장한다.
+
+    refresh token은 갱신할 때마다 바뀌므로 반드시 파일에 되돌려 써야
+    Claude Code도 새 토큰을 이어서 쓸 수 있다.
+    """
+    with open(path, encoding="utf-8") as f:
+        creds = json.load(f)
+    oauth = creds["claudeAiOauth"]
+    if not oauth.get("refreshToken"):
+        raise FetchError("토큰 만료 (Claude Code 한 번 실행)")
+
+    body = json.dumps(
+        {"grant_type": "refresh_token", "refresh_token": oauth["refreshToken"], "client_id": CLAUDE_CLIENT_ID}
+    ).encode("utf-8")
+    last_error = "토큰 갱신 실패"
+    for url in CLAUDE_TOKEN_URLS:
+        req = urllib.request.Request(
+            url, data=body, headers={"Content-Type": "application/json", "User-Agent": "usage-widget/1.0"}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                token = json.loads(resp.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as e:
+            if e.code in (400, 401):  # refresh token 자체가 무효 → 재로그인 필요
+                raise FetchError("로그인 만료 (claude 실행 후 /login)")
+            last_error = f"토큰 갱신 실패 (HTTP {e.code})"
+        except (urllib.error.URLError, TimeoutError) as e:
+            last_error = f"토큰 갱신 실패: {getattr(e, 'reason', e)}"
+    else:
+        raise FetchError(last_error)
+
+    oauth["accessToken"] = token["access_token"]
+    if token.get("refresh_token"):
+        oauth["refreshToken"] = token["refresh_token"]
+    if token.get("expires_in"):
+        oauth["expiresAt"] = int((datetime.now(timezone.utc).timestamp() + token["expires_in"]) * 1000)
+
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(creds, f)
+    os.replace(tmp, path)
+    return oauth
+
+
 def fetch_claude():
     path = os.path.join(CLAUDE_DIR, ".credentials.json")
     try:
@@ -94,8 +147,8 @@ def fetch_claude():
         raise FetchError("credentials.json 형식 오류")
 
     expires_at = oauth.get("expiresAt")
-    if expires_at and expires_at / 1000 < datetime.now(timezone.utc).timestamp():
-        raise FetchError("토큰 만료 (Claude Code 한 번 실행)")
+    if expires_at and expires_at / 1000 < datetime.now(timezone.utc).timestamp() + 60:
+        oauth = refresh_claude_token(path)
 
     data = http_get_json(
         "https://api.anthropic.com/api/oauth/usage",
